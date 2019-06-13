@@ -115,40 +115,42 @@ __global__ void EmbeddingBag_accGradParametersKernel_sum_avg(
     int64_t *input, int64_t *indices, scalar_t *gradOutput,
     scalar_t *gradWeight, int64_t *offset2bag, int64_t *count, ptrdiff_t numel,
     int64_t stride, int mode, const int64_t *bag_size,
-    scalar_t* per_sample_weights, int64_t per_sample_weights_stride,
-    int64_t* segment_offsets, int64_t num_of_segments) {
+    scalar_t* per_sample_weights, int64_t per_sample_weights_stride) {
 
   using accscalar_t = acc_type<scalar_t, true>;
-  const int id = blockIdx.y * blockDim.y + threadIdx.y;
+  int idx = blockIdx.y * blockDim.y + threadIdx.y;
   const int startFeature = blockIdx.x * blockDim.x + threadIdx.x;
   if (startFeature >= stride) {
     return;
   }
-  if (id >= num_of_segments) {
-    return;
-  }
-  const int idx_end = (id == num_of_segments-1)?numel:segment_offsets[id+1];
 
-  for (int idx=segment_offsets[id]; idx < idx_end; ++idx) {
-    const int weightRow = ((int)input[idx]) * stride;
-    const int origRow = ((int)indices[idx]);
-    const int seq_number = offset2bag[origRow];
-    const int gradOutputRow = ((int)seq_number) * stride;
+  if (idx < numel && (idx == 0 || input[idx] != input[idx - 1])) {
+    do {
+      const int weightRow = ((int)input[idx]) * stride;
 
-    accscalar_t scale = count ? (accscalar_t)1.0 / count[idx] : 1.0;
-    if (per_sample_weights) {
-      scale *= per_sample_weights[origRow * per_sample_weights_stride];
-    }
+      // Note: only this line changes from LookupTable_accgradParametersKernel
+      const int origRow = ((int)indices[idx]);
+      const int seq_number = offset2bag[origRow];
+      const int gradOutputRow = ((int)seq_number) * stride;
 
-    accscalar_t gradient = static_cast<accscalar_t>(gradOutput[gradOutputRow + startFeature]);
+      accscalar_t scale = count ? (accscalar_t)1.0 / count[idx] : 1.0;
+      if (per_sample_weights) {
+        scale *= per_sample_weights[origRow * per_sample_weights_stride];
+      }
 
-    if (mode == MODE_MEAN) {
-      gradient /= bag_size[seq_number];
-    }
-    accscalar_t weight = static_cast<accscalar_t>(gradWeight[weightRow + startFeature]);
-    weight += gradient * scale;
+      accscalar_t gradient = static_cast<accscalar_t>(gradOutput[gradOutputRow + startFeature]);
 
-    gradWeight[weightRow + startFeature] = static_cast<scalar_t>(weight);
+      if (mode == MODE_MEAN) {
+        gradient /= bag_size[seq_number];
+      }
+      accscalar_t weight = static_cast<accscalar_t>(gradWeight[weightRow + startFeature]);
+      weight += gradient * scale;
+
+      int featureDim = startFeature;
+      gradWeight[weightRow + startFeature] = static_cast<scalar_t>(weight);
+
+      idx++;
+    } while (idx < numel && input[idx] == input[idx - 1]);
   }
 }
 
@@ -244,7 +246,7 @@ Tensor embedding_bag_backward_cuda_sum_avg(
   int64_t num_of_segments = thrust::get<0>(ends) - dummy_dev;
 
 
-  dim3 grid(THCCeilDiv(stride, (ptrdiff_t)32), THCCeilDiv(num_of_segments, (int64_t)32));
+  dim3 grid(THCCeilDiv(stride, (ptrdiff_t)32), THCCeilDiv(numel, (int64_t)32));
   dim3 block(32, 32);
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
       grad.scalar_type(), "embedding_bag_backward_cuda_sum_avg_kernel", [&] {
@@ -256,8 +258,7 @@ Tensor embedding_bag_backward_cuda_sum_avg(
             count.defined() ? count.data<int64_t>() : nullptr, numel, stride,
             mode, bag_size.data<int64_t>(),
             per_sample_weights.defined() ? per_sample_weights.data<scalar_t>() : NULL,
-            per_sample_weights.defined() ? per_sample_weights.stride(0) : 0,
-            segment_offsets.data<int64_t>(), num_of_segments);
+            per_sample_weights.defined() ? per_sample_weights.stride(0) : 0);
       });
 
   THCudaCheck(cudaGetLastError());
