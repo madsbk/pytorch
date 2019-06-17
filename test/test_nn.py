@@ -2415,6 +2415,8 @@ class TestNN(NNTestCase):
         else:
             needed_prec = backward_prec
 
+        print(es_weight_grad)
+        print(e.weight.grad)
         self.assertEqual(es_weight_grad, e.weight.grad, needed_prec)
 
         if test_per_sample_weights and trainable_per_sample_weights:
@@ -2700,6 +2702,9 @@ class TestNN(NNTestCase):
             grad = torch.randn_like(expected)
             result.backward(grad)
             expected.backward(grad)
+
+            print(es.weight.grad)
+            print(reference_weights.grad)
             self.assertEqual(es.weight.grad, reference_weights.grad,
                              dtype2prec[dtype])
             if trainable_scale:

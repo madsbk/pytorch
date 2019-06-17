@@ -13,6 +13,7 @@
 
 #include <thrust/execution_policy.h>
 #include <thrust/unique.h>
+#include <thrust/device_vector.h>
 
 const int WARP_SIZE = 32;
 const int MODE_SUM = 0;
@@ -104,6 +105,38 @@ __global__ void EmbeddingBag_updateOutputKernel(
   }
 }
 
+__global__
+void segment_sizes_kernel(int64_t *ret, const int64_t *segment_offsets,
+                          int64_t num_of_segments, int64_t blocksize, int64_t numel) {
+  const int id = blockIdx.x * blockDim.x + threadIdx.x;
+  if(id < num_of_segments) {
+    const int64_t idx_start = segment_offsets[id];
+    const int64_t idx_end = (id == num_of_segments-1)?numel:segment_offsets[id+1];
+    const int64_t size = idx_end - idx_start;
+    ret[id] = (size + blocksize - 1) / blocksize  ;
+  }
+}
+
+__global__
+void split_segment_offsets_kernel(
+        int64_t *ret,
+        const int64_t *segment_sizes,
+        const int64_t *segment_sizes_offsets,
+        const int64_t *segment_offsets,
+        int64_t num_of_segments,
+        int64_t blocksize) {
+  const int id = blockIdx.x * blockDim.x + threadIdx.x;
+  if(id < num_of_segments) {
+    int64_t idx = segment_sizes_offsets[id];
+    const int64_t segment_size = segment_sizes[id];
+    const int64_t segment_offset = segment_offsets[id];
+    for (int64_t i=0; i<segment_size; ++i) {
+      ret[idx++] = segment_offset + i * blocksize;
+    }
+  }
+}
+
+
 // FIXME: removed the accGradParametersKernelByFeature case present in
 // LookupTable. That kernel is faster at small sizes (<768 indices), which
 // does not need EmbeddingBag (LookupTable + Sum works fine), but would
@@ -126,16 +159,12 @@ __global__ void EmbeddingBag_accGradParametersKernel_sum_avg(
   if (id >= num_of_segments) {
     return;
   }
+  const int idx_begin = segment_offsets[id];
   const int idx_end = (id == num_of_segments-1)?numel:segment_offsets[id+1];
 
   // FIXME: use `acc_type<scalar_t, true>` for improved accuracy.
   scalar_t weight = 0;
-  int tt = input[segment_offsets[id]];
-  for (int idx=segment_offsets[id]; idx < idx_end; ++idx) {
-    if(tt != input[idx]) {
-      printf("WTF\n");
-    }
-
+  for (int idx=idx_begin; idx < idx_end; ++idx) {
     const int origRow = indices[idx];
     const int seq_number = offset2bag[origRow];
     const int gradOutputRow = ((int)seq_number) * stride;
@@ -146,12 +175,12 @@ __global__ void EmbeddingBag_accGradParametersKernel_sum_avg(
     }
 
     scalar_t gradient = gradOutput[gradOutputRow + startFeature];
-
     if (mode == MODE_MEAN) {
       gradient /= bag_size[seq_number];
     }
     weight += gradient * scale;
   }
+//  printf("(%d, %d) weight: %lf, idx: %ld, idx_end: %d\n", id, startFeature, (double) weight, segment_offsets[id], idx_end);
   grad_weight_per_segment[id * stride + startFeature] = weight;
 }
 
@@ -162,7 +191,8 @@ __global__ void EmbeddingBag_accGradParametersKernel_scatter(
     scalar_t *gradWeight, int64_t *offset2bag, int64_t *count, ptrdiff_t numel,
     int64_t stride, int mode, const int64_t *bag_size,
     scalar_t* per_sample_weights, int64_t per_sample_weights_stride,
-    int64_t* segment_offsets, int64_t num_of_segments, const scalar_t *grad_weight_per_segment) {
+    int64_t* segment_offsets, int64_t num_of_segments, const scalar_t *grad_weight_per_segment,
+    const int64_t *segment_sizes_offsets) {
 
   const int id = blockIdx.y * blockDim.y + threadIdx.y;
   const int startFeature = blockIdx.x * blockDim.x + threadIdx.x;
@@ -172,8 +202,15 @@ __global__ void EmbeddingBag_accGradParametersKernel_scatter(
   if (id >= num_of_segments) {
     return;
   }
+
+  const int idx_begin = segment_sizes_offsets[id];
+  const int idx_end = (id == num_of_segments-1)?numel:segment_sizes_offsets[id+1];
+  scalar_t weight = 0;
+  for (int idx=idx_begin; idx < idx_end; ++idx) {
+    weight += grad_weight_per_segment[idx*stride + startFeature];
+  }
   const int weightRow = ((int)input[segment_offsets[id]]) * stride;
-  gradWeight[weightRow + startFeature] = grad_weight_per_segment[id*stride + startFeature];
+  gradWeight[weightRow + startFeature] = weight;
 }
 
 
@@ -267,17 +304,69 @@ Tensor embedding_bag_backward_cuda_sum_avg(
           dummy_dev,
           segment_offsets_dev);
   int64_t num_of_segments = thrust::get<0>(ends) - dummy_dev;
-/*
+
   std::cout << "\n\nnumel: " << numel <<  std::endl;
   std::cout << "sorted_indices/input" <<  std::endl;
   std::cout << sorted_indices << std::endl;
+  std::cout << "indices" <<  std::endl;
+  std::cout << indices << std::endl;
   std::cout << "segment_offsets" <<  std::endl;
   std::cout << segment_offsets << std::endl;
   std::cout << "num_of_segments: " <<  num_of_segments << std::endl;
-*/
-  auto grad_weight_per_segment = at::empty({num_of_segments, stride}, grad.options());
 
-  dim3 grid(THCCeilDiv(stride, (ptrdiff_t)32), THCCeilDiv(num_of_segments, (int64_t)32));
+  std::cout << "grad" <<  std::endl;
+  std::cout << grad << std::endl;
+
+  int64_t blocksize = 1000000;
+  thrust::device_vector<int64_t> segment_sizes(num_of_segments);
+  {
+    segment_sizes_kernel<<<THCCeilDiv(num_of_segments, (ptrdiff_t)32), 32, 0, stream>>> (
+            thrust::raw_pointer_cast(segment_sizes.data()),
+                    thrust::raw_pointer_cast(segment_offsets_dev),
+                    num_of_segments,
+                    blocksize,
+                    numel);
+  }
+
+  std::cout << "segment_sizes" <<  std::endl;
+  for(int i = 0; i < segment_sizes.size(); i++)
+    std::cout << segment_sizes[i] << ", ";
+  std::cout << std::endl;
+
+  thrust::device_vector<int64_t> segment_sizes_offsets(num_of_segments);
+  thrust::exclusive_scan(
+          policy,
+          segment_sizes.begin(),
+          segment_sizes.end(),
+          segment_sizes_offsets.begin());
+
+  std::cout << "segment_sizes_offsets" <<  std::endl;
+  for(int i = 0; i < segment_sizes_offsets.size(); i++)
+    std::cout << segment_sizes_offsets[i] << ", ";
+  std::cout << std::endl;
+
+  int64_t num_of_split_segments = segment_sizes[num_of_segments-1] + segment_sizes_offsets[num_of_segments-1];
+  std::cout << "num_of_split_segments: " <<  num_of_split_segments << std::endl;
+
+  thrust::device_vector<int64_t> split_segment_offsets(num_of_split_segments);
+  {
+    split_segment_offsets_kernel<<<THCCeilDiv(num_of_segments, (ptrdiff_t)32), 32, 0, stream>>> (
+            thrust::raw_pointer_cast(split_segment_offsets.data()),
+                    thrust::raw_pointer_cast(segment_sizes.data()),
+                    thrust::raw_pointer_cast(segment_sizes_offsets.data()),
+                    thrust::raw_pointer_cast(segment_offsets_dev),
+                    num_of_segments,
+                    blocksize);
+  }
+
+  std::cout << "split_segment_offsets" <<  std::endl;
+  for(int i = 0; i < split_segment_offsets.size(); i++)
+    std::cout << split_segment_offsets[i] << ", ";
+  std::cout << std::endl;
+
+
+  auto grad_weight_per_segment = at::empty({num_of_split_segments, stride}, grad.options());
+  dim3 grid(THCCeilDiv(stride, (ptrdiff_t)32), THCCeilDiv(num_of_split_segments, (int64_t)32));
   dim3 block(32, 32);
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
       grad.scalar_type(), "embedding_bag_backward_cuda_sum_avg_kernel", [&] {
@@ -290,17 +379,20 @@ Tensor embedding_bag_backward_cuda_sum_avg(
             mode, bag_size.data<int64_t>(),
             per_sample_weights.defined() ? per_sample_weights.data<scalar_t>() : NULL,
             per_sample_weights.defined() ? per_sample_weights.stride(0) : 0,
-            segment_offsets.data<int64_t>(), num_of_segments, grad_weight_per_segment.data<scalar_t>());
+            thrust::raw_pointer_cast(split_segment_offsets.data()),
+            num_of_split_segments, grad_weight_per_segment.data<scalar_t>());
       });
   THCudaCheck(cudaGetLastError());
-/*
+
   std::cout << "grad_weight_per_segment" <<  std::endl;
   std::cout << grad_weight_per_segment << std::endl;
-*/
+
+  dim3 grid2(THCCeilDiv(stride, (ptrdiff_t)32), THCCeilDiv(num_of_segments, (int64_t)32));
+
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
     grad.scalar_type(), "EmbeddingBag_accGradParametersKernel_scatter", [&] {
       EmbeddingBag_accGradParametersKernel_scatter<
-          scalar_t><<<grid, block, 0, stream>>>(
+          scalar_t><<<grid2, block, 0, stream>>>(
           sorted_indices.data<int64_t>(), orig_indices.data<int64_t>(),
           grad.data<scalar_t>(), grad_weight.data<scalar_t>(),
           offset2bag.data<int64_t>(),
@@ -308,14 +400,16 @@ Tensor embedding_bag_backward_cuda_sum_avg(
           mode, bag_size.data<int64_t>(),
           per_sample_weights.defined() ? per_sample_weights.data<scalar_t>() : NULL,
           per_sample_weights.defined() ? per_sample_weights.stride(0) : 0,
-          segment_offsets.data<int64_t>(), num_of_segments, grad_weight_per_segment.data<scalar_t>());
+          segment_offsets.data<int64_t>(), num_of_segments, grad_weight_per_segment.data<scalar_t>(),
+          thrust::raw_pointer_cast(segment_sizes_offsets.data()));
     });
   THCudaCheck(cudaGetLastError());
 
-/*
+
   std::cout << "grad_weight" <<  std::endl;
   std::cout << grad_weight << std::endl;
-*/
+
+  //exit(0);
   return grad_weight;
 }
 
