@@ -113,7 +113,7 @@ void segment_sizes_kernel(int64_t *ret, const int64_t *segment_offsets,
     const int64_t idx_start = segment_offsets[id];
     const int64_t idx_end = (id == num_of_segments-1)?numel:segment_offsets[id+1];
     const int64_t size = idx_end - idx_start;
-    ret[id] = (size + blocksize - 1) / blocksize  ;
+    ret[id] = (size + blocksize - 1) / blocksize;
   }
 }
 
@@ -151,8 +151,15 @@ __global__ void EmbeddingBag_accGradParametersKernel_sum_avg(
     scalar_t* per_sample_weights, int64_t per_sample_weights_stride,
     int64_t* segment_offsets, int64_t num_of_segments, scalar_t *grad_weight_per_segment) {
 
-  const int id = blockIdx.y * blockDim.y + threadIdx.y;
-  const int startFeature = blockIdx.x * blockDim.x + threadIdx.x;
+  const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int block_stride = ((stride + 32 - 1) / 32) * 32;
+  const int id = gid / block_stride;
+  const int startFeature = gid % block_stride;
+
+
+
+  //const int id = blockIdx.y * blockDim.y + threadIdx.y;
+  //const int startFeature = blockIdx.x * blockDim.x + threadIdx.x;
   if (startFeature >= stride) {
     return;
   }
@@ -161,6 +168,8 @@ __global__ void EmbeddingBag_accGradParametersKernel_sum_avg(
   }
   const int idx_begin = segment_offsets[id];
   const int idx_end = (id == num_of_segments-1)?numel:segment_offsets[id+1];
+
+//      printf("gid %d, stride: %ld, block_stride: %d, id: %d, startFeat: %d\n", gid, stride, block_stride, id, startFeature);
 
   // FIXME: use `acc_type<scalar_t, true>` for improved accuracy.
   scalar_t weight = 0;
@@ -377,8 +386,11 @@ Tensor embedding_bag_backward_cuda_sum_avg(
 */
 
   auto grad_weight_per_segment = at::empty({num_of_split_segments, stride}, grad.options());
-  dim3 grid(THCCeilDiv(stride, (ptrdiff_t)32), THCCeilDiv(num_of_split_segments, (int64_t)32));
-  dim3 block(32, 32);
+  //dim3 grid(THCCeilDiv(stride, (ptrdiff_t)32), THCCeilDiv(num_of_split_segments, (int64_t)32));
+  //dim3 block(32, 32);
+  int block(THCCeilDiv(stride, (ptrdiff_t)32)*32);
+  int grid(num_of_split_segments);
+//  std::cout << "num_of_split_segments: " << num_of_split_segments << ", grid: " << grid << ", block: " << block << std::endl;
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
       grad.scalar_type(), "embedding_bag_backward_cuda_sum_avg_kernel", [&] {
         EmbeddingBag_accGradParametersKernel_sum_avg<
@@ -399,11 +411,11 @@ Tensor embedding_bag_backward_cuda_sum_avg(
   std::cout << grad_weight_per_segment << std::endl;
 */
   dim3 grid2(THCCeilDiv(stride, (ptrdiff_t)32), THCCeilDiv(num_of_segments, (int64_t)32));
-
+  dim3 block2(32, 32);
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
     grad.scalar_type(), "EmbeddingBag_accGradParametersKernel_scatter", [&] {
       EmbeddingBag_accGradParametersKernel_scatter<
-          scalar_t><<<grid2, block, 0, stream>>>(
+          scalar_t><<<grid2, block2, 0, stream>>>(
           sorted_indices.data<int64_t>(), orig_indices.data<int64_t>(),
           grad.data<scalar_t>(), grad_weight.data<scalar_t>(),
           offset2bag.data<int64_t>(),
