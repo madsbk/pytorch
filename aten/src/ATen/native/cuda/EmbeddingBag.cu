@@ -203,8 +203,14 @@ __global__ void EmbeddingBag_accGradParametersKernel_scatter(
     int64_t* segment_offsets, int64_t num_of_segments, const scalar_t *grad_weight_per_segment,
     const int64_t *segment_sizes_offsets, int64_t num_of_split_segments) {
 
-  const int id = blockIdx.y * blockDim.y + threadIdx.y;
-  const int startFeature = blockIdx.x * blockDim.x + threadIdx.x;
+  const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int block_stride = ((stride + 32 - 1) / 32) * 32;
+  const int id = gid / block_stride;
+  const int startFeature = gid % block_stride;
+
+  //const int id = blockIdx.y * blockDim.y + threadIdx.y;
+  //const int startFeature = blockIdx.x * blockDim.x + threadIdx.x;
+
   if (startFeature >= stride) {
     return;
   }
@@ -410,8 +416,10 @@ Tensor embedding_bag_backward_cuda_sum_avg(
   std::cout << "grad_weight_per_segment" <<  std::endl;
   std::cout << grad_weight_per_segment << std::endl;
 */
-  dim3 grid2(THCCeilDiv(stride, (ptrdiff_t)32), THCCeilDiv(num_of_segments, (int64_t)32));
-  dim3 block2(32, 32);
+  //dim3 grid2(THCCeilDiv(stride, (ptrdiff_t)32), THCCeilDiv(num_of_segments, (int64_t)32));
+  //dim3 block2(32, 32);
+  int block2(THCCeilDiv(stride, (ptrdiff_t)32)*32);
+  int grid2(num_of_segments);
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
     grad.scalar_type(), "EmbeddingBag_accGradParametersKernel_scatter", [&] {
       EmbeddingBag_accGradParametersKernel_scatter<
