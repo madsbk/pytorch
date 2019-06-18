@@ -25,6 +25,9 @@ namespace native {
 
 namespace {
 
+constexpr int CUDA_WARP_SIZE = 32;
+constexpr int CUDA_MAX_BLOCK_SIZE = 1024;
+
 // This kernel assumes that all input tensors except `weight` and
 // per_sample_weights are contiguous.
 template <typename scalar_t>
@@ -149,12 +152,13 @@ __global__ void EmbeddingBag_accGradParametersKernel_sum_avg(
     scalar_t *gradWeight, int64_t *offset2bag, int64_t *count, ptrdiff_t numel,
     int64_t stride, int mode, const int64_t *bag_size,
     scalar_t* per_sample_weights, int64_t per_sample_weights_stride,
-    int64_t* segment_offsets, int64_t num_of_segments, scalar_t *grad_weight_per_segment) {
+    int64_t* segment_offsets, int64_t num_of_segments, scalar_t *grad_weight_per_segment,
+    const int64_t stride_warped) {
 
   const int gid = blockIdx.x * blockDim.x + threadIdx.x;
-  const int block_stride = ((stride + 32 - 1) / 32) * 32;
-  const int id = gid / block_stride;
-  const int startFeature = gid % block_stride;
+  //const int block_stride = ((stride + 32 - 1) / 32) * 32;
+  const int id = gid / stride_warped;
+  const int startFeature = gid % stride_warped;
 
 
 
@@ -172,18 +176,18 @@ __global__ void EmbeddingBag_accGradParametersKernel_sum_avg(
 //      printf("gid %d, stride: %ld, block_stride: %d, id: %d, startFeat: %d\n", gid, stride, block_stride, id, startFeature);
 
   // FIXME: use `acc_type<scalar_t, true>` for improved accuracy.
-  scalar_t weight = 0;
+  acc_type<scalar_t, true> weight = 0;
   for (int idx=idx_begin; idx < idx_end; ++idx) {
     const int origRow = indices[idx];
     const int seq_number = offset2bag[origRow];
-    const int gradOutputRow = ((int)seq_number) * stride;
+    const int gradOutputRow = seq_number * stride;
 
-    scalar_t scale = count ? 1.0 / count[idx] : 1.0;
+    acc_type<scalar_t, true> scale = count ? 1.0 / count[idx] : 1.0;
     if (per_sample_weights) {
       scale *= per_sample_weights[origRow * per_sample_weights_stride];
     }
 
-    scalar_t gradient = gradOutput[gradOutputRow + startFeature];
+    acc_type<scalar_t, true> gradient = gradOutput[gradOutputRow + startFeature];
     if (mode == MODE_MEAN) {
       gradient /= bag_size[seq_number];
     }
@@ -201,12 +205,12 @@ __global__ void EmbeddingBag_accGradParametersKernel_scatter(
     int64_t stride, int mode, const int64_t *bag_size,
     scalar_t* per_sample_weights, int64_t per_sample_weights_stride,
     int64_t* segment_offsets, int64_t num_of_segments, const scalar_t *grad_weight_per_segment,
-    const int64_t *segment_sizes_offsets, int64_t num_of_split_segments) {
+    const int64_t *segment_sizes_offsets, int64_t num_of_split_segments,
+    const int64_t stride_warped) {
 
   const int gid = blockIdx.x * blockDim.x + threadIdx.x;
-  const int block_stride = ((stride + 32 - 1) / 32) * 32;
-  const int id = gid / block_stride;
-  const int startFeature = gid % block_stride;
+  const int id = gid / stride_warped;
+  const int startFeature = gid % stride_warped;
 
   //const int id = blockIdx.y * blockDim.y + threadIdx.y;
   //const int startFeature = blockIdx.x * blockDim.x + threadIdx.x;
@@ -220,12 +224,12 @@ __global__ void EmbeddingBag_accGradParametersKernel_scatter(
 
   const int idx_begin = segment_sizes_offsets[id];
   const int idx_end = (id == num_of_segments-1)?num_of_split_segments:segment_sizes_offsets[id+1];
-  scalar_t weight = 0;
+  acc_type<scalar_t, true> weight = 0;
   for (int idx=idx_begin; idx < idx_end; ++idx) {
     weight += grad_weight_per_segment[idx*stride + startFeature];
   }
   //printf("idx_begin: %d, idx_end: %d, weight: %lf\n", idx_begin, idx_end, (double) weight);
-  const int weightRow = ((int)input[segment_offsets[id]]) * stride;
+  const int weightRow = input[segment_offsets[id]] * stride;
 /*
   printf("(%d, %d) weightRow: %d, segment_offsets: %d, input: %d, idx_begin: %d, idx_end: %d, weight: %f\n",
           id, startFeature, weightRow, segment_offsets[id], ((int)input[segment_offsets[id]]),
@@ -394,9 +398,11 @@ Tensor embedding_bag_backward_cuda_sum_avg(
   auto grad_weight_per_segment = at::empty({num_of_split_segments, stride}, grad.options());
   //dim3 grid(THCCeilDiv(stride, (ptrdiff_t)32), THCCeilDiv(num_of_split_segments, (int64_t)32));
   //dim3 block(32, 32);
-  int block(THCCeilDiv(stride, (ptrdiff_t)32)*32);
-  int grid(num_of_split_segments);
-//  std::cout << "num_of_split_segments: " << num_of_split_segments << ", grid: " << grid << ", block: " << block << std::endl;
+  const int stride_warped = THCCeilDiv(stride, (ptrdiff_t)CUDA_WARP_SIZE)*CUDA_WARP_SIZE;
+  const int block = std::min(stride_warped, CUDA_MAX_BLOCK_SIZE);
+  //int grid(num_of_split_segments);
+  const int grid = THCCeilDiv(num_of_split_segments*stride_warped, (ptrdiff_t)block);
+  //std::cout << "num_of_split_segments: " << num_of_split_segments << ", grid: " << grid << ", block: " << block << std::endl;
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
       grad.scalar_type(), "embedding_bag_backward_cuda_sum_avg_kernel", [&] {
         EmbeddingBag_accGradParametersKernel_sum_avg<
@@ -409,7 +415,7 @@ Tensor embedding_bag_backward_cuda_sum_avg(
             per_sample_weights.defined() ? per_sample_weights.data<scalar_t>() : NULL,
             per_sample_weights.defined() ? per_sample_weights.stride(0) : 0,
             thrust::raw_pointer_cast(split_segment_offsets.data()),
-            num_of_split_segments, grad_weight_per_segment.data<scalar_t>());
+            num_of_split_segments, grad_weight_per_segment.data<scalar_t>(), stride_warped);
       });
   THCudaCheck(cudaGetLastError());
 /*
@@ -418,12 +424,12 @@ Tensor embedding_bag_backward_cuda_sum_avg(
 */
   //dim3 grid2(THCCeilDiv(stride, (ptrdiff_t)32), THCCeilDiv(num_of_segments, (int64_t)32));
   //dim3 block2(32, 32);
-  int block2(THCCeilDiv(stride, (ptrdiff_t)32)*32);
-  int grid2(num_of_segments);
+  //int block2(THCCeilDiv(stride, (ptrdiff_t)32)*32);
+  const int grid2 = THCCeilDiv(num_of_segments*stride_warped, (ptrdiff_t)block);
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
     grad.scalar_type(), "EmbeddingBag_accGradParametersKernel_scatter", [&] {
       EmbeddingBag_accGradParametersKernel_scatter<
-          scalar_t><<<grid2, block2, 0, stream>>>(
+          scalar_t><<<grid2, block, 0, stream>>>(
           sorted_indices.data<int64_t>(), orig_indices.data<int64_t>(),
           grad.data<scalar_t>(), grad_weight.data<scalar_t>(),
           offset2bag.data<int64_t>(),
@@ -432,7 +438,7 @@ Tensor embedding_bag_backward_cuda_sum_avg(
           per_sample_weights.defined() ? per_sample_weights.data<scalar_t>() : NULL,
           per_sample_weights.defined() ? per_sample_weights.stride(0) : 0,
           segment_offsets.data<int64_t>(), num_of_segments, grad_weight_per_segment.data<scalar_t>(),
-          thrust::raw_pointer_cast(segment_sizes_offsets.data()), num_of_split_segments);
+          thrust::raw_pointer_cast(segment_sizes_offsets.data()), num_of_split_segments, stride_warped);
     });
   THCudaCheck(cudaGetLastError());
 
