@@ -184,7 +184,7 @@ Tensor embedding_bag_backward_cuda_sum_avg(
         thrust::equal_to<int64_t>(), thrust::maximum<int64_t>());
   }
 
-  return embedding_bag_dense_backward_cuda(grad, orig_indices, sorted_indices,
+  return embedding_bag_backward_cuda_kernel(grad, orig_indices, sorted_indices,
           offset2bag, bag_size, count, num_weights, scale_grad_by_freq,
           mode == MODE_MEAN, per_sample_weights);
 }

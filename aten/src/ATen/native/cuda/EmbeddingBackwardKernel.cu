@@ -20,10 +20,6 @@ namespace native {
 
 namespace {
 
-constexpr int MODE_SUM = 0;
-constexpr int MODE_MEAN = 1;
-constexpr int MODE_MAX = 2;
-
 constexpr int MAX_BLOCK_SIZE = 1024;
 constexpr int NROWS_PER_THREAD = 10;
 
@@ -141,7 +137,7 @@ __global__ void compute_grad_weight(
   for (int idx=idx_begin; idx < idx_end; ++idx) {
     const accscalar_t scale = count ? (accscalar_t)1.0 / count[idx] : 1.0;
     const int gradOutputRow = indices[idx] * stride;
-    
+
     weight += gradOutput[gradOutputRow + startFeature] * scale;
   }
   grad_weight_per_segment[id * stride + startFeature] = weight;
@@ -178,7 +174,7 @@ __global__ void sum_and_scatter(
 } // anon namespace
 
 
-Tensor embedding_bag_dense_backward_cuda(
+Tensor embedding_bag_backward_cuda_kernel(
         const Tensor &grad,
         const Tensor &orig_indices,
         const Tensor &sorted_indices,
@@ -277,14 +273,12 @@ Tensor embedding_bag_dense_backward_cuda(
   return grad_weight;
 }
 
-Tensor embedding_dense_backward_cuda(
+Tensor embedding_backward_cuda_kernel(
         const Tensor &grad,
         const Tensor &orig_indices,
         const Tensor &sorted_indices,
         const Tensor &count,
         int64_t num_weights,
-        bool scale_grad_by_freq,
-        bool mode_mean,
         int64_t padding_idx) {
 
   auto stream = at::cuda::getCurrentCUDAStream();
