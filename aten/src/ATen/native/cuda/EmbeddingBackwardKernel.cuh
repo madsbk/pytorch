@@ -20,7 +20,7 @@
 namespace at {
 namespace native {
 
-Tensor embedding_dense_backward_cuda(
+Tensor embedding_bag_dense_backward_cuda(
         const Tensor &grad,
         const Tensor &orig_indices,
         const Tensor &sorted_indices,
